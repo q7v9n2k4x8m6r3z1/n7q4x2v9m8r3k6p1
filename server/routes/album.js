@@ -1,0 +1,84 @@
+import express from 'express';
+import multer from 'multer';
+import {
+  uploadAlbum,
+  uploadTrackToAlbum,
+  getAlbums,
+  getAlbum,
+  getAlbumTracks,
+  getAlbumStatus,
+  deleteAlbum,
+  toggleFeatured,
+  getFeaturedAlbums,
+  updateAlbum,
+  bulkDeleteAlbums,
+  bulkAssignAlbums,
+  bulkUpdateCover,
+  bulkUpdateCategory,
+  bulkCategoryByParent,
+  bulkCoverByParent
+} from '../controllers/albumController.js';
+import { protect, authorize } from '../middleware/auth.js';
+
+const router = express.Router();
+
+// Multer for album ZIP + optional cover art
+const albumUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB
+});
+
+// Multer for cover art image only
+const coverUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+});
+
+// Multer for single MP3 track upload
+const trackUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB per track
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'audio/mpeg' || file.originalname.toLowerCase().endsWith('.mp3')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only MP3 files are allowed'), false);
+    }
+  }
+});
+
+router.post('/upload', protect, authorize('admin'), albumUpload.fields([
+  { name: 'albumZip', maxCount: 1 },
+  { name: 'coverArt', maxCount: 1 }
+]), uploadAlbum);
+
+router.route('/')
+  .get(getAlbums);
+
+router.route('/featured')
+  .get(getFeaturedAlbums);
+
+// Bulk routes — must be before /:id to avoid route conflicts
+router.delete('/bulk', protect, authorize('admin'), bulkDeleteAlbums);
+router.put('/bulk-assign', protect, authorize('admin'), bulkAssignAlbums);
+router.put('/bulk-category', protect, authorize('admin'), bulkUpdateCategory);
+router.put('/bulk-category-by-parent', protect, authorize('admin'), bulkCategoryByParent);
+router.put('/bulk-cover', protect, authorize('admin'), coverUpload.single('coverArt'), bulkUpdateCover);
+router.put('/bulk-cover-by-parent', protect, authorize('admin'), coverUpload.single('coverArt'), bulkCoverByParent);
+
+router.route('/:id')
+  .get(getAlbum)
+  .put(protect, authorize('admin'), coverUpload.single('coverArt'), updateAlbum)
+  .delete(protect, authorize('admin'), deleteAlbum);
+
+router.route('/:id/featured')
+  .put(protect, authorize('admin'), toggleFeatured);
+
+router.route('/:id/status')
+  .get(getAlbumStatus);
+
+router.route('/:id/tracks')
+  .get(getAlbumTracks)
+  .post(protect, authorize('admin'), trackUpload.single('trackFile'), uploadTrackToAlbum);
+
+export default router;

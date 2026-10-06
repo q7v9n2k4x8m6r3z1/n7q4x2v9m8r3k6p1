@@ -1,0 +1,634 @@
+import User, { PAST_DUE_GRACE_MS } from '../models/User.js';
+import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import { getSignedDownloadUrl } from '../config/wasabi.js';
+import { sendEmail, sendWelcomeEmail, sendPasswordResetEmail, notifyAdminNewSignup, getDeviceBlockedEmailTemplate } from '../services/emailService.js';
+import { registerDevice, pruneInactiveDevices, recordBlockedAttempt } from '../utils/deviceRegistry.js';
+import { issueDeviceManageUrl } from '../utils/deviceManageToken.js';
+
+// Sign avatar URL if it's stored in Wasabi
+const signAvatarUrl = async (user) => {
+  if (user.avatarKey) {
+    try {
+      return await getSignedDownloadUrl(user.avatarKey, 7200);
+    } catch (e) {
+      console.warn('Failed to sign avatar URL:', e.message);
+    }
+  }
+  return user.avatar;
+};
+
+// Generate JWT Token
+const generateToken = (id) => {
+  return jwt.sign({ id }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRE
+  });
+};
+
+// Send token response and register/update device
+const sendTokenResponse = async (user, statusCode, res, req) => {
+  const token = generateToken(user._id);
+  const deviceId = req?.body?.deviceId || req?.headers['x-device-id'] || null;
+  const userAgent = req?.headers['user-agent'] || 'Unknown Device';
+  const ipAddress = req?.ip || req?.connection?.remoteAddress || 'unknown';
+
+  const options = {
+    expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax'
+  };
+
+  // Register or update device atomically (see utils/deviceRegistry.js).
+  // Previously this loaded → mutated subscription.devices → user.save(), which
+  // lost devices when two logins/requests raced. Atomic ops can't clobber.
+  if (deviceId) {
+    const { parseDeviceInfo } = await import('../utils/deviceParser.js');
+    const SubscriptionPlan = (await import('../models/SubscriptionPlan.js')).default;
+    const deviceInfo = parseDeviceInfo(userAgent);
+
+    // Determine max devices based on subscription status
+    let maxDevices = 0; // Free accounts get 0 devices (no downloads)
+
+    // Shared PAST_DUE_GRACE_MS from the User model — the single place the
+    // policy lives (currently ZERO). This hardcoded its own 10 days, so a
+    // lapsed account was still handed its full plan device allowance at login
+    // for ten days after access itself had ended. Window bounded at both ends:
+    // `now - endDate < GRACE` alone is also true for a FUTURE endDate.
+    const _isWithinPeriod = !!user.subscription.endDate && new Date() <= new Date(user.subscription.endDate);
+    const _msSinceExpiry = user.subscription.endDate
+      ? Date.now() - new Date(user.subscription.endDate).getTime()
+      : null;
+    const _isPastDueInGrace = user.subscription.status === 'past_due' &&
+      _msSinceExpiry !== null &&
+      _msSinceExpiry >= 0 &&
+      _msSinceExpiry < PAST_DUE_GRACE_MS;
+    const _hasValidSub = user.subscription.planId && (
+      user.subscription.status === 'active' ||
+      // past_due inside the paid period keeps its devices — the failed renewal
+      // is for the NEXT period. Mirrors requireSubscription.
+      (user.subscription.status === 'past_due' && _isWithinPeriod) ||
+      (user.subscription.status === 'cancelled' && _isWithinPeriod) ||
+      _isPastDueInGrace
+    );
+    if (_hasValidSub) {
+      const plan = await SubscriptionPlan.findOne({ planId: user.subscription.planId });
+      if (plan) {
+        maxDevices = plan.features.maxDevices;
+      } else {
+        // SubscriptionPlan doc missing/renamed for this planId — don't silently
+        // treat a paying user as free-tier and skip device registration.
+        // Mirrors the fallback in checkDeviceLimit (subscription.js).
+        console.warn(`⚠️  sendTokenResponse: no SubscriptionPlan doc for planId="${user.subscription.planId}" — falling back to user.maxDevices`);
+        maxDevices = user.maxDevices || 2;
+      }
+    }
+
+    // A deliberate password login on this device outranks an earlier removal:
+    // clear the revocation so the user can bring a device back without waiting
+    // out the TTL. (Whether it then fits within the limit is decided below.)
+    await User.updateOne(
+      { _id: user._id },
+      { $pull: { revokedDevices: { deviceId } } }
+    ).catch(() => { /* non-fatal */ });
+
+    // Only enforce device registration for paying users; free accounts get none.
+    if (maxDevices > 0) {
+      await pruneInactiveDevices(user._id);
+      const result = await registerDevice(user._id, deviceId, { ...deviceInfo, ipAddress }, { maxDevices });
+
+      if (result === 'limit') {
+        // Device limit reached — notify the account owner and block this device.
+        try {
+          const lang = user.preferredLanguage || 'es';
+          // Tokenised link so the BLOCKED device — which has no session — can
+          // free a slot itself. Failure to mint one is not fatal; the template
+          // falls back to the /subscription link.
+          const manageUrl = await issueDeviceManageUrl(user._id).catch(() => null);
+          const { subject, html, text } = getDeviceBlockedEmailTemplate(user, maxDevices, deviceInfo, ipAddress, lang, manageUrl);
+          await sendEmail({ to: user.email, subject, html, text });
+        } catch (emailError) {
+          console.error('Failed to send device block email:', emailError);
+        }
+        await recordBlockedAttempt(user._id, {
+          deviceName: deviceInfo.deviceName,
+          browser: deviceInfo.browser,
+          os: deviceInfo.os,
+          ipAddress,
+          userAgent,
+          attemptedAt: new Date()
+        });
+        return res.status(403).json({
+          success: false,
+          deviceLimitReached: true,
+          maxDevices,
+          message: `This account has reached its device limit (${maxDevices} device${maxDevices > 1 ? 's' : ''}). The account owner has been notified by email. Please ask the account owner to remove a device from their settings.`
+        });
+      }
+    }
+  }
+
+  // Persist any caller-set fields (e.g. lastLogin). Device registration above
+  // is already committed atomically and is NOT re-written here — sendTokenResponse
+  // no longer mutates subscription.devices in memory, so save() leaves it untouched.
+  if (user.isModified()) {
+    await user.save();
+  }
+  // Reflect the freshly-registered device back to the client.
+  if (deviceId) {
+    const refreshed = await User.findById(user._id).select('subscription');
+    if (refreshed) user.subscription = refreshed.subscription;
+  }
+
+  const avatar = await signAvatarUrl(user);
+
+  const response = {
+    success: true,
+    token,
+    user: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      phoneNumber: user.phoneNumber || '',
+      role: user.role,
+      subscription: user.subscription,
+      avatar
+    }
+  };
+
+  res.status(statusCode)
+    .cookie('token', token, options)
+    .json(response);
+};
+
+// @desc    Register user
+// @route   POST /api/auth/register
+// @access  Public
+export const register = async (req, res) => {
+  try {
+    const { name, email, password, phoneNumber, instagram, preferredLanguage } = req.body;
+
+    // Phone and Instagram are mandatory for NEW registrations (support needs
+    // them to identify and contact users). Enforced here rather than in the
+    // schema so the accounts that predate this rule keep working — a
+    // schema-level requirement would break their next save(), including the
+    // one during login.
+    if (!phoneNumber || !String(phoneNumber).trim()) {
+      return res.status(400).json({ success: false, message: 'Phone number is required' });
+    }
+    if (!instagram || !String(instagram).trim()) {
+      return res.status(400).json({ success: false, message: 'Instagram is required' });
+    }
+
+    // Accept the formats people actually type — "+1 234 567 8900",
+    // "(555) 123-4567" — by stripping separators before validating. The stored
+    // pattern allows none of them, and the form's own placeholder contained
+    // spaces, so a user following the example would have been rejected.
+    const normalisedPhone = String(phoneNumber).replace(/[\s()\-.]/g, '');
+    if (!/^\+?[1-9]\d{6,14}$/.test(normalisedPhone)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid phone number, including country code (e.g. +34 612 345 678)'
+      });
+    }
+
+    // Accept a handle, an @handle, or a full profile URL; store the bare
+    // handle so support can search it consistently.
+    const normalisedInstagram = String(instagram)
+      .trim()
+      .replace(/^(https?:\/\/)?(www\.)?instagram\.com\//i, '')
+      .replace(/\/+$/, '')
+      .replace(/^@+/, '')
+      .split(/[?#]/)[0];
+    if (!/^[A-Za-z0-9._]{1,30}$/.test(normalisedInstagram)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide a valid Instagram username (letters, numbers, dots and underscores)'
+      });
+    }
+
+    // Check if user exists
+    const userExists = await User.findOne({ email });
+    if (userExists) {
+      return res.status(400).json({
+        success: false,
+        message: 'User already exists with this email'
+      });
+    }
+
+    // Detect language from request or default to 'en'
+    const language = preferredLanguage || 
+                    (req.headers['accept-language']?.startsWith('es') ? 'es' : 'en');
+
+    // Create user
+    const user = await User.create({
+      name,
+      email,
+      password,
+      phoneNumber: normalisedPhone,
+      instagram: normalisedInstagram,
+      preferredLanguage: language
+    });
+
+    // Send welcome email (non-blocking)
+    sendWelcomeEmail(user).catch(err => console.error('Welcome email failed:', err));
+
+    // Notify admin of new signup (non-blocking)
+    notifyAdminNewSignup(user).catch(err => console.error('Admin signup notification failed:', err));
+
+    await sendTokenResponse(user, 201, res, req);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Login user
+// @route   POST /api/auth/login
+// @access  Public
+export const login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Validate email & password
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide email and password'
+      });
+    }
+
+    // Check for user
+    const user = await User.findOne({ email }).select('+password');
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Check if password matches
+    const isMatch = await user.comparePassword(password);
+
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Update last login
+    user.lastLogin = new Date();
+
+    await sendTokenResponse(user, 200, res, req);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get current logged in user
+// @route   GET /api/auth/me
+// @access  Private
+export const getMe = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+
+    // Auto-expire subscription if endDate has passed
+    // Stripe-managed subs get a 48h grace window to allow renewal webhook delivery
+    if (
+      user.subscription?.endDate &&
+      new Date() > user.subscription.endDate &&
+      user.subscription.status === 'active'
+    ) {
+      const hoursSinceExpiry = (Date.now() - new Date(user.subscription.endDate).getTime()) / (1000 * 60 * 60);
+      const hasStripeSub = !!user.subscription.stripeSubscriptionId;
+      const shouldExpire = !hasStripeSub || hoursSinceExpiry > 48;
+      if (shouldExpire) {
+        user.subscription.status = 'expired';
+        await user.save();
+      }
+    }
+
+    const avatar = await signAvatarUrl(user);
+    const userData = user.toObject();
+    userData.avatar = avatar;
+    userData.id = user._id.toString();
+
+    // Re-sync the httpOnly cookie with the current Bearer token
+    // This prevents stale cookies (e.g. from a previous admin session)
+    // from persisting after a cross-site redirect (e.g. Stripe checkout)
+    let token;
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+      token = req.headers.authorization.split(' ')[1];
+    }
+    if (token) {
+      const cookieOptions = {
+        expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax'
+      };
+      res.cookie('token', token, cookieOptions);
+    }
+
+    res.status(200).json({
+      success: true,
+      data: userData
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Logout user / clear cookie
+// @route   GET /api/auth/logout
+// @access  Private
+export const logout = async (req, res) => {
+  // Clear activeToken on the device but keep it registered
+  let token;
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    token = req.headers.authorization.split(' ')[1];
+  } else if (req.cookies.token) {
+    token = req.cookies.token;
+  }
+
+
+  res.cookie('token', 'none', {
+    expires: new Date(Date.now() + 10 * 1000),
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax'
+  });
+
+  res.status(200).json({
+    success: true,
+    message: 'User logged out successfully'
+  });
+};
+
+// @desc    Refresh JWT token
+// @route   POST /api/auth/refresh
+// @access  Private
+export const refreshToken = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user || !user.isActive) {
+      return res.status(401).json({ success: false, message: 'User not found or inactive' });
+    }
+
+    const newToken = generateToken(user._id);
+    const avatar = await signAvatarUrl(user);
+
+    const cookieOptions = {
+      expires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax'
+    };
+
+    res.status(200)
+      .cookie('token', newToken, cookieOptions)
+      .json({
+        success: true,
+        token: newToken,
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          subscription: user.subscription,
+          avatar
+        }
+      });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Update user details
+// @route   PUT /api/auth/updatedetails
+// @access  Private
+export const updateDetails = async (req, res) => {
+  try {
+    const fieldsToUpdate = {
+      name: req.body.name,
+      email: req.body.email,
+      avatar: req.body.avatar,
+      phoneNumber: req.body.phoneNumber
+    };
+
+    const user = await User.findByIdAndUpdate(req.user.id, fieldsToUpdate, {
+      new: true,
+      runValidators: true
+    });
+
+    res.status(200).json({
+      success: true,
+      data: user
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Update password
+// @route   PUT /api/auth/updatepassword
+// @access  Private
+export const updatePassword = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('+password');
+
+    // Check current password
+    if (!(await user.comparePassword(req.body.currentPassword))) {
+      return res.status(401).json({
+        success: false,
+        message: 'Password is incorrect'
+      });
+    }
+
+    user.password = req.body.newPassword;
+    await user.save();
+
+    await sendTokenResponse(user, 200, res, req);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Delete own account
+// @route   DELETE /api/auth/me
+// @access  Private
+export const deleteMe = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if (user.role === 'admin') return res.status(400).json({ success: false, message: 'Admin accounts cannot be self-deleted' });
+
+    await User.findByIdAndDelete(req.user.id);
+
+    res.cookie('token', 'none', { expires: new Date(Date.now() + 10 * 1000), httpOnly: true });
+    res.status(200).json({ success: true, message: 'Account deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Forgot password
+// @route   POST /api/auth/forgotpassword
+// @access  Public
+export const forgotPassword = async (req, res) => {
+  try {
+    const user = await User.findOne({ email: req.body.email });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'No user found with that email'
+      });
+    }
+
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+
+    // Hash token and set to resetPasswordToken field
+    user.resetPasswordToken = crypto
+      .createHash('sha256')
+      .update(resetToken)
+      .digest('hex');
+
+    // Set expire time (1 hour)
+    user.resetPasswordExpire = Date.now() + 60 * 60 * 1000;
+
+    await user.save({ validateBeforeSave: false });
+
+    // Send email
+    try {
+      const emailResult = await sendPasswordResetEmail(user, resetToken);
+
+      if (!emailResult?.success) {
+        console.error('Password reset email provider failed:', JSON.stringify(emailResult?.error, null, 2));
+        user.resetPasswordToken = undefined;
+        user.resetPasswordExpire = undefined;
+        await user.save({ validateBeforeSave: false });
+
+        return res.status(500).json({
+          success: false,
+          message: 'Email could not be sent'
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: 'Password reset email sent'
+      });
+    } catch (err) {
+      console.error('Error sending password reset email:', err);
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpire = undefined;
+      await user.save({ validateBeforeSave: false });
+
+      return res.status(500).json({
+        success: false,
+        message: 'Email could not be sent'
+      });
+    }
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Reset password
+// @route   PUT /api/auth/resetpassword/:resettoken
+// @access  Public
+export const resetPassword = async (req, res) => {
+  try {
+    // Get hashed token
+    const resetPasswordToken = crypto
+      .createHash('sha256')
+      .update(req.params.resettoken)
+      .digest('hex');
+
+    const user = await User.findOne({
+      resetPasswordToken,
+      resetPasswordExpire: { $gt: Date.now() }
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired token'
+      });
+    }
+
+    // Set new password
+    user.password = req.body.password;
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    await user.save();
+
+    await sendTokenResponse(user, 200, res, req);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Issue a fresh JWT after client-side WebAuthn biometric verification
+// @route   POST /api/auth/biometric-login
+// @access  Public (WebAuthn already verified on client side)
+export const biometricLogin = async (req, res) => {
+  try {
+    const { userId, deviceId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'User ID required' });
+    }
+
+    if (!deviceId) {
+      return res.status(400).json({ success: false, message: 'Device ID required' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user || !user.isActive) {
+      return res.status(401).json({ success: false, message: 'User not found or inactive' });
+    }
+
+    // For users who have registered devices, verify this device was previously
+    // authenticated with a password — prevents anyone with just a userId from
+    // obtaining a JWT via this public endpoint.
+    const registeredDevices = user.subscription?.devices || [];
+    if (registeredDevices.length > 0) {
+      const isKnownDevice = registeredDevices.some(d => d.deviceId === deviceId);
+      if (!isKnownDevice) {
+        return res.status(401).json({
+          success: false,
+          message: 'Device not recognised. Please login with your password first.'
+        });
+      }
+    }
+
+    await sendTokenResponse(user, 200, res, req);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};

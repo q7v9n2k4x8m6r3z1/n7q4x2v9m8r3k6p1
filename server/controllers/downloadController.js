@@ -1,0 +1,1125 @@
+import Download from '../models/Download.js';
+import Track from '../models/Track.js';
+import Mashup from '../models/Mashup.js';
+import Album from '../models/Album.js';
+import Source from '../models/Source.js';
+import User from '../models/User.js';
+import { getSignedDownloadUrl } from '../config/wasabi.js';
+import s3Client from '../config/wasabi.js';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import archiver from 'archiver';
+import { notifyAdminSuspiciousDownloads } from '../services/emailService.js';
+
+// ── Download behaviour detection thresholds ──────────────────────────────
+// These MUST match the Terms & Conditions exactly — two independent rules,
+// each with its own window and its own Level 1 (warn, allow to continue) /
+// Level 2 (24h suspension) thresholds:
+//   ZIP:  10 in 30 min → warn   | 15 in 30 min → suspend 24h
+//   MP3: 100 in 60 min → warn   | 150 in 60 min → suspend 24h
+// A prior revision widened these to a 24h/80/100 "daily quota" to close a
+// perceived evasion gap, but that contradicted the published ToS numbers —
+// reverted here to the ToS values.
+const ZIP_WINDOW_MS       = 30 * 60 * 1000;         // 30-min rolling window for ZIPs
+const MP3_WINDOW_MS       = 60 * 60 * 1000;         // 60-min rolling window for MP3s
+const ZIP_L1_THRESHOLD    = 10;              // 10 ZIPs in 30 min  → Level 1 warning
+const ZIP_L2_THRESHOLD    = 15;              // 15 ZIPs in 30 min  → Level 2 pause (24h)
+const MP3_L1_THRESHOLD    = 100;             // 100 MP3s in 60 min → Level 1 warning
+const MP3_L2_THRESHOLD    = 150;             // 150 MP3s in 60 min → Level 2 pause (24h)
+const LEVEL2_PAUSE_MS     = 24 * 60 * 60 * 1000; // 24 h
+
+// Atomically bump download counters. Previously this was
+// user.incrementDownload() + user.save(), which rewrote the WHOLE user doc —
+// under concurrent "very fast" downloading a stale save could clobber the
+// downloadSuspended / downloadWarningLevel flags set by another in-flight
+// request, so re-abuse (especially right after an admin lift) failed to
+// re-suspend. A targeted $inc touches only the counters.
+async function incrementDownloadCounters(userId) {
+  await User.updateOne(
+    { _id: userId },
+    {
+      $inc: { 'downloads.today': 1, 'downloads.total': 1 },
+      $set: { 'downloads.lastDownloadDate': new Date() },
+    }
+  );
+}
+
+async function checkDownloadBehaviour(user) {
+  const now = new Date();
+  const liftedAt = user.downloadLiftedAt;
+
+  // If an admin (or auto) lift happened, only count downloads that occurred
+  // after the lift — old downloads won't re-trigger the protection, but any
+  // new abuse after the lift is still enforced normally.
+  const mp3Cutoff = new Date(now - MP3_WINDOW_MS);
+  const zipCutoff = new Date(now - ZIP_WINDOW_MS);
+  const effectiveMp3Cutoff = liftedAt && liftedAt > mp3Cutoff ? liftedAt : mp3Cutoff;
+  const effectiveZipCutoff = liftedAt && liftedAt > zipCutoff ? liftedAt : zipCutoff;
+
+  const [totalZips, totalMp3s] = await Promise.all([
+    Download.countDocuments({ userId: user._id, fileType: 'ZIP', createdAt: { $gte: effectiveZipCutoff } }),
+    Download.countDocuments({ userId: user._id, fileType: 'MP3', createdAt: { $gte: effectiveMp3Cutoff } })
+  ]);
+
+  let newLevel = 0;
+  if      (totalZips >= ZIP_L2_THRESHOLD) newLevel = 2;
+  else if (totalZips >= ZIP_L1_THRESHOLD) newLevel = 1;
+  if      (totalMp3s >= MP3_L2_THRESHOLD) newLevel = 2;
+  else if (totalMp3s >= MP3_L1_THRESHOLD && newLevel < 1) newLevel = 1;
+
+  // Diagnostic: visible in `pm2 logs` so abuse-detection behaviour can be
+  // verified in production (counts, window baseline, computed level).
+  console.log(
+    `[download-protection] user=${user.email || user._id} zips=${totalZips}/${ZIP_L2_THRESHOLD} mp3s=${totalMp3s}/${MP3_L2_THRESHOLD} ` +
+    `level=${newLevel} currentLevel=${user.downloadWarningLevel || 0} liftedAt=${liftedAt ? new Date(liftedAt).toISOString() : 'none'}`
+  );
+
+  // Escalation is done with atomic, conditional, idempotent updates so it can
+  // never be lost to a concurrent save and never double-notifies. Levels are
+  // "sticky" until a lift (admin or auto) resets them — the correct behaviour
+  // for abuse detection (we don't auto-forgive mid-window).
+  if (newLevel === 2) {
+    // Flip to suspended exactly once. The downloadSuspended:{$ne:true} guard
+    // means only the first crossing request transitions the state (and emails
+    // the admin); everything else is a no-op.
+    const pausedUntil = new Date(now.getTime() + LEVEL2_PAUSE_MS);
+    const res = await User.updateOne(
+      { _id: user._id, downloadSuspended: { $ne: true } },
+      {
+        $set: {
+          downloadWarningLevel: 2,
+          downloadSuspended: true,
+          downloadSuspendedAt: now,
+          downloadPausedUntil: pausedUntil,
+        },
+      }
+    );
+    // Keep the in-memory copy consistent for the rest of this request.
+    user.downloadSuspended = true;
+    user.downloadWarningLevel = 2;
+    user.downloadPausedUntil = pausedUntil;
+    if (res.modifiedCount > 0) {
+      const mp3Triggered = totalMp3s >= MP3_L2_THRESHOLD;
+      const dlCount = mp3Triggered ? totalMp3s : totalZips;
+      const windowLabel = mp3Triggered ? MP3_WINDOW_MS / 60000 : ZIP_WINDOW_MS / 60000;
+      notifyAdminSuspiciousDownloads(user, dlCount, windowLabel).catch(() => {});
+    }
+    return { level: 2, pausedUntil };
+  }
+
+  if (newLevel === 1) {
+    // Raise to the level-1 warning only if not already warned/suspended, so
+    // the popup fires once per abuse epoch.
+    const res = await User.updateOne(
+      { _id: user._id, downloadSuspended: { $ne: true }, downloadWarningLevel: { $lt: 1 } },
+      { $set: { downloadWarningLevel: 1 } }
+    );
+    if (res.modifiedCount > 0) {
+      user.downloadWarningLevel = 1;
+      return { level: 1 };
+    }
+  }
+
+  return null;
+}
+
+function buildSuspensionResponse(user) {
+  return { success: false, downloadLevel: 2, pausedUntil: user.downloadPausedUntil, message: 'Downloads temporarily paused due to unusual activity. Try again after the pause expires.' };
+}
+
+async function applyAutoLift(user) {
+  if (user.downloadSuspended && user.downloadPausedUntil && new Date() > new Date(user.downloadPausedUntil)) {
+    const now = new Date();
+    // Atomic so a concurrent download save can't resurrect the suspension.
+    await User.updateOne(
+      { _id: user._id, downloadSuspended: true, downloadPausedUntil: { $lte: now } },
+      {
+        $set: {
+          downloadSuspended: false,
+          downloadPausedUntil: null,
+          downloadWarningLevel: 0,
+          downloadLiftedAt: now, // Fresh window from this point
+        },
+      }
+    );
+    // Reflect on the in-memory copy so the caller's suspended check passes.
+    user.downloadSuspended = false;
+    user.downloadPausedUntil = null;
+    user.downloadWarningLevel = 0;
+    user.downloadLiftedAt = now;
+  }
+}
+
+const parseUA = (ua = '') => {
+  const s = ua.toLowerCase();
+  const browser =
+    s.includes('chrome') ? 'Chrome' :
+    s.includes('firefox') ? 'Firefox' :
+    s.includes('safari') && !s.includes('chrome') ? 'Safari' :
+    s.includes('edge') ? 'Edge' :
+    s.includes('opera') ? 'Opera' : 'Other';
+  const os =
+    s.includes('windows') ? 'Windows' :
+    s.includes('mac os') ? 'macOS' :
+    s.includes('android') ? 'Android' :
+    s.includes('iphone') || s.includes('ipad') ? 'iOS' :
+    s.includes('linux') ? 'Linux' : 'Other';
+  const device =
+    s.includes('mobile') || s.includes('android') || s.includes('iphone') ? 'Mobile' :
+    s.includes('tablet') || s.includes('ipad') ? 'Tablet' : 'Desktop';
+  return { browser, os, device };
+};
+
+const buildSafeFilename = (name) => {
+  return String(name || 'download')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+// @desc    Download single track
+// @route   POST /api/downloads/track/:id
+// @access  Private
+export const downloadTrack = async (req, res) => {
+  try {
+    const track = await Track.findById(req.params.id);
+
+    if (!track) {
+      return res.status(404).json({
+        success: false,
+        message: 'Track not found'
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+
+    // Admin bypasses all download restrictions
+    if (user.role !== 'admin') {
+      await applyAutoLift(user);
+      if (user.downloadSuspended) return res.status(403).json(buildSuspensionResponse(user));
+      // Check if user can download
+      if (!user.canDownload()) {
+        // canDownload returns false for exactly one reason: no active paid
+        // subscription. It enforces no per-day cap. This used to report
+        // "Daily download limit reached. Your plan allows N downloads per
+        // day", so a customer whose subscription had lapsed was told they had
+        // hit a daily limit — describing a restriction that does not exist and
+        // hiding the one that does.
+        return res.status(403).json({
+          success: false,
+          message: 'An active subscription is required to download.',
+          requiresSubscription: true,
+          upgradeRequired: true
+        });
+      }
+
+      // Check subscription tier requirements
+      const tierLevels = { free: 0, premium: 1, pro: 2 };
+      const userTier = tierLevels[user.subscription.planId];
+      const requiredTier = tierLevels[track.requiredPlan || 'free'];
+
+      if (userTier < requiredTier) {
+        return res.status(403).json({
+          success: false,
+          message: `This track requires ${track.requiredPlan} subscription`,
+          upgradeRequired: true
+        });
+      }
+    }
+
+    // Generate signed download URL
+    const downloadUrl = await getSignedDownloadUrl(track.audioFile.key, 3600); // 1 hour expiry
+
+    // Log download
+    const { browser: b1, os: o1, device: d1 } = parseUA(req.get('user-agent'));
+    const downloadDoc = {
+      userId: user._id,
+      trackId: track._id,
+      type: 'single',
+      fileType: 'MP3',
+      fileName: `${track.artist || 'Unknown'} - ${track.title || 'Unknown'}.mp3`,
+      email: user.email || '',
+      section: req.headers['x-download-section'] || req.query.section || 'library',
+      planId: user.subscription?.planId || user.subscription?.plan || 'free',
+      deviceBrowser: b1,
+      deviceOS: o1,
+      deviceName: d1,
+      fileSize: track.audioFile.size,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent')
+    };
+    if (track.albumId) downloadDoc.albumId = track.albumId;
+    if (track.sourceId) downloadDoc.sourceId = track.sourceId;
+    await Download.create(downloadDoc);
+
+    // Update counters (atomic $inc — never rewrites the whole user doc, so it
+    // can't clobber suspension flags set by a concurrent download request)
+    await incrementDownloadCounters(user._id);
+
+    track.downloads += 1;
+    await track.save();
+
+    if (track.albumId) {
+      const album = await Album.findById(track.albumId);
+      if (album) { album.totalDownloads += 1; await album.save(); }
+    }
+
+    if (track.sourceId) {
+      const source = await Source.findById(track.sourceId);
+      if (source) { source.totalDownloads += 1; await source.save(); }
+    }
+
+    const behaviourResult = user.role !== 'admin' ? await checkDownloadBehaviour(user).catch(err => { console.error('[download-protection] check failed:', err.message); return null; }) : null;
+    const response = { success: true, data: { downloadUrl, track: { id: track._id, title: track.title, artist: track.artist, format: track.audioFile.format, size: track.audioFile.size }, expiresIn: 3600 } };
+    if (behaviourResult) response.downloadWarning = behaviourResult;
+    return res.status(200).json(response);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Download single track file (streamed)
+// @route   GET /api/downloads/track/:id/file
+// @access  Private
+export const downloadTrackFile = async (req, res) => {
+  try {
+    const track = await Track.findById(req.params.id) || await Mashup.findById(req.params.id);
+
+    if (!track) {
+      return res.status(404).json({ success: false, message: 'Track not found' });
+    }
+
+    const user = await User.findById(req.user.id);
+
+    // Admin bypasses all download restrictions
+    if (user.role !== 'admin') {
+      await applyAutoLift(user);
+      if (user.downloadSuspended) {
+        // Same fix as downloadAlbumFile: a relative redirect resolves against
+        // the API's own origin (api.tododjs.com), not the frontend
+        // (tododjs.com) — must be absolute or the SPA never mounts to show
+        // the popup.
+        if (req.query.token) {
+          const pausedUntil = user.downloadPausedUntil ? new Date(user.downloadPausedUntil).toISOString() : '';
+          const frontendUrl = process.env.FRONTEND_URL || 'https://tododjs.com';
+          return res.redirect(`${frontendUrl}/record-pool?downloadBlocked=2&pausedUntil=${encodeURIComponent(pausedUntil)}`);
+        }
+        return res.status(403).json(buildSuspensionResponse(user));
+      }
+      if (!user.canDownload()) {
+        // Same as above: the only way to land here is no active paid
+        // subscription, so the "daily limit" branch was unreachable and its
+        // condition was a third hand-rolled copy of the access window.
+        return res.status(403).json({
+          success: false,
+          message: 'An active subscription is required to download.',
+          requiresSubscription: true,
+          upgradeRequired: true
+        });
+      }
+    }
+
+    // Verify audio file key exists BEFORE logging or incrementing counters
+    if (!track.audioFile?.key) {
+      return res.status(400).json({
+        success: false,
+        message: 'Track audio file is missing'
+      });
+    }
+
+    // Log download
+    const { browser: b2, os: o2, device: d2 } = parseUA(req.get('user-agent'));
+    const downloadDoc = {
+      userId: user._id,
+      trackId: track._id,
+      type: 'single',
+      fileType: 'MP3',
+      fileName: `${track.artist || 'Unknown'} - ${track.title || 'Unknown'}.mp3`,
+      email: user.email || '',
+      section: req.headers['x-download-section'] || req.query.section || 'library',
+      planId: user.subscription?.planId || user.subscription?.plan || 'free',
+      deviceBrowser: b2,
+      deviceOS: o2,
+      deviceName: d2,
+      fileSize: track.audioFile?.size || 0,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent')
+    };
+    if (track.albumId) downloadDoc.albumId = track.albumId;
+    if (track.sourceId) downloadDoc.sourceId = track.sourceId;
+    await Download.create(downloadDoc);
+
+    // Update counters (atomic $inc — never rewrites the whole user doc, so it
+    // can't clobber suspension flags set by a concurrent download request)
+    await incrementDownloadCounters(user._id);
+
+    track.downloads += 1;
+    await track.save();
+
+    if (track.albumId) {
+      const album = await Album.findById(track.albumId);
+      if (album) {
+        album.totalDownloads += 1;
+        await album.save();
+      }
+    }
+
+    if (track.sourceId) {
+      const source = await Source.findById(track.sourceId);
+      if (source) {
+        source.totalDownloads += 1;
+        await source.save();
+      }
+    }
+
+    const behaviourResult2 = user.role !== 'admin' ? await checkDownloadBehaviour(user).catch(err => { console.error('[download-protection] check failed:', err.message); return null; }) : null;
+
+    const filename = buildSafeFilename(`${track.artist || 'Unknown Artist'} - ${track.title || 'Unknown Title'}.mp3`);
+    const command = new GetObjectCommand({
+      Bucket: process.env.WASABI_BUCKET_NAME,
+      Key: track.audioFile.key,
+      ResponseContentDisposition: `attachment; filename="${filename}"`
+    });
+    const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+
+    if (req.query.token) return res.redirect(signedUrl);
+
+    const resp2 = { success: true, downloadUrl: signedUrl, filename };
+    if (behaviourResult2) resp2.downloadWarning = behaviourResult2;
+    return res.status(200).json(resp2);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Download album (bulk)
+// @route   POST /api/downloads/album/:id
+// @access  Private
+export const downloadAlbum = async (req, res) => {
+  try {
+    const album = await Album.findById(req.params.id);
+
+    if (!album) {
+      return res.status(404).json({
+        success: false,
+        message: 'Album not found'
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+
+    // Admin bypasses all subscription checks
+    if (user.role !== 'admin') {
+      await applyAutoLift(user);
+      if (user.downloadSuspended) return res.status(403).json(buildSuspensionResponse(user));
+      const hasPlan = user.subscription?.planId || (user.subscription?.plan && user.subscription.plan !== 'free');
+      const isWithinPeriod = !!user.subscription?.endDate && new Date() <= new Date(user.subscription.endDate);
+      const hasAccess = user.subscription?.status === 'active' || (user.subscription?.status === 'cancelled' && isWithinPeriod);
+      if (!hasPlan || !hasAccess) {
+        return res.status(403).json({
+          success: false,
+          message: 'Bulk album downloads require an active subscription',
+          upgradeRequired: true
+        });
+      }
+    }
+
+    // Generate signed download URL for ZIP
+    const downloadUrl = await getSignedDownloadUrl(album.zipKey, 3600);
+
+    // Log download
+    const { browser: b3, os: o3, device: d3 } = parseUA(req.get('user-agent'));
+    await Download.create({
+      userId: user._id,
+      albumId: album._id,
+      sourceId: album.sourceId,
+      type: 'bulk',
+      fileType: 'ZIP',
+      fileName: `${album.name || 'Album'}.zip`,
+      email: user.email || '',
+      section: req.headers['x-download-section'] || req.query.section || 'record-pool',
+      planId: user.subscription?.planId || user.subscription?.plan || 'free',
+      deviceBrowser: b3,
+      deviceOS: o3,
+      deviceName: d3,
+      fileSize: album.totalSize,
+      ipAddress: req.ip,
+      userAgent: req.get('user-agent')
+    });
+
+    // Update counters
+    album.totalDownloads += 1;
+    await album.save();
+
+    const source = await Source.findById(album.sourceId);
+    if (source) {
+      source.totalDownloads += album.trackCount;
+      await source.save();
+    }
+
+    const behaviourResult3 = user.role !== 'admin' ? await checkDownloadBehaviour(user).catch(err => { console.error('[download-protection] check failed:', err.message); return null; }) : null;
+    const resp3 = { success: true, data: { downloadUrl, album: { id: album._id, name: album.name, trackCount: album.trackCount, size: album.totalSize }, expiresIn: 3600 } };
+    if (behaviourResult3) resp3.downloadWarning = behaviourResult3;
+    return res.status(200).json(resp3);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Download album ZIP file (streamed)
+// @route   GET /api/downloads/album/:id/file
+// @access  Private
+export const downloadAlbumFile = async (req, res) => {
+  try {
+    const album = await Album.findById(req.params.id);
+
+    if (!album) {
+      return res.status(404).json({
+        success: false,
+        message: 'Album not found'
+      });
+    }
+    const user = await User.findById(req.user.id);
+
+    if (user.role !== 'admin') {
+      await applyAutoLift(user);
+      if (user.downloadSuspended) {
+        console.log(`[download-protection] BLOCKED zip request for user=${user.email || user._id} (pausedUntil=${user.downloadPausedUntil})`);
+        // Browser navigation (?token=): a JSON 403 would replace the SPA with a
+        // raw error page (or be silently dropped). Bounce back into the app with
+        // query params so the protection modal is shown instead.
+        // MUST be an absolute URL: the API is served from a different subdomain
+        // than the frontend in production (api.tododjs.com vs tododjs.com), so a
+        // relative redirect resolves against the API's own origin and 404s there
+        // — the SPA never mounts and the popup never appears. This was the actual
+        // cause of "ZIP suspension detected but popup/block never shows".
+        if (req.query.token) {
+          const pausedUntil = user.downloadPausedUntil ? new Date(user.downloadPausedUntil).toISOString() : '';
+          const frontendUrl = process.env.FRONTEND_URL || 'https://tododjs.com';
+          return res.redirect(`${frontendUrl}/record-pool?downloadBlocked=2&pausedUntil=${encodeURIComponent(pausedUntil)}`);
+        }
+        return res.status(403).json(buildSuspensionResponse(user));
+      }
+    }
+
+    const { browser: b4, os: o4, device: d4 } = parseUA(req.get('user-agent'));
+    const logAlbumDownload = async () => {
+      await Download.create({
+        userId: user._id,
+        albumId: album._id,
+        sourceId: album.sourceId,
+        type: 'bulk',
+        fileType: 'ZIP',
+        fileName: `${album.name || 'Album'}.zip`,
+        email: user.email || '',
+        section: req.headers['x-download-section'] || req.query.section || 'record-pool',
+        planId: user.subscription?.planId || user.subscription?.plan || 'free',
+        deviceBrowser: b4,
+        deviceOS: o4,
+        deviceName: d4,
+        fileSize: album.totalSize,
+        ipAddress: req.ip,
+        userAgent: req.get('user-agent')
+      });
+
+      album.totalDownloads += 1;
+      await album.save();
+
+      if (album.sourceId) {
+        const source = await Source.findById(album.sourceId);
+        if (source) {
+          source.totalDownloads += album.trackCount;
+          await source.save();
+        }
+      }
+
+      return user.role !== 'admin' ? await checkDownloadBehaviour(user).catch(err => { console.error('[download-protection] check failed:', err.message); return null; }) : null;
+    };
+
+    // If a pre-built ZIP exists on Wasabi, redirect to a signed URL for fast direct download.
+    // The server can't observe whether the client's subsequent fetch of the signed URL
+    // actually succeeds, so — same as the single-track flow — we log at hand-off time.
+    if (album.zipKey) {
+      const behaviourResult4 = await logAlbumDownload();
+      const zipFilename = buildSafeFilename(`${album.name || 'Album'}.zip`);
+      const command = new GetObjectCommand({
+        Bucket: process.env.WASABI_BUCKET_NAME,
+        Key: album.zipKey,
+        ResponseContentDisposition: `attachment; filename="${zipFilename}"`
+      });
+      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+      // If opened directly in browser (token via query param), redirect so the browser downloads natively.
+      // Level-1 warnings for this hand-off aren't carried on this response (a
+      // cookie set here would be scoped to the API's own subdomain and
+      // unreadable by the frontend, and this redirect goes straight to
+      // Wasabi, not back to our domain) — the frontend instead polls
+      // /api/auth/me after triggering the download (see pollDownloadWarning).
+      if (req.query.token) {
+        return res.redirect(signedUrl);
+      }
+      const resp4 = { success: true, downloadUrl: signedUrl, filename: zipFilename };
+      if (behaviourResult4) resp4.downloadWarning = behaviourResult4;
+      return res.status(200).json(resp4);
+    }
+
+    // No pre-built ZIP — build one on-the-fly from the album's tracks
+    const tracks = await Track.find({ albumId: album._id });
+
+    if (!tracks || tracks.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No tracks found for this album'
+      });
+    }
+
+    // Eager behaviour check BEFORE streaming. The post-completion check (on
+    // res 'finish') persists the warning level but can't block the response
+    // that crossed the line — headers are long gone. Without this, on-the-fly
+    // ZIPs showed the Level-1 popup late and a Level-2 crossing only took
+    // effect on the NEXT click. Counting here (this download not yet logged)
+    // means limits trigger on the attempt AFTER the threshold is exceeded,
+    // matching the ToS wording. checkDownloadBehaviour is idempotent per
+    // level, so the finish-time check never double-fires notifications.
+    if (user.role !== 'admin') {
+      const preCheck = await checkDownloadBehaviour(user).catch(() => null);
+      if (preCheck?.level === 2) {
+        if (req.query.token) {
+          const pausedUntil = preCheck.pausedUntil ? new Date(preCheck.pausedUntil).toISOString() : '';
+          return res.redirect(`/record-pool?downloadBlocked=2&pausedUntil=${encodeURIComponent(pausedUntil)}`);
+        }
+        return res.status(403).json(buildSuspensionResponse(user));
+      }
+    }
+
+    const filename = buildSafeFilename(`${album.name || 'Album'}.zip`);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // MP3/audio content is already compressed — re-deflating it costs real CPU time
+    // and latency for near-zero size savings. Store-only makes large albums build
+    // dramatically faster (this was a big contributor to "takes a very long time").
+    const archive = archiver('zip', { zlib: { level: 0 } });
+
+    archive.on('error', (err) => {
+      console.error('Archiver error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, message: 'ZIP creation failed' });
+      } else {
+        // Headers are already out, so the status cannot be changed — but the
+        // socket must still be closed. Previously this branch did nothing,
+        // which left the connection open indefinitely: the browser sat on a
+        // download that never progressed and never failed.
+        res.destroy(err);
+      }
+    });
+
+    // Only count this as a download once the ZIP has actually finished streaming
+    // to the client. Logging eagerly (the old behaviour) meant every retry of a
+    // stalled/aborted download — see the frontend timeout fix — registered as a
+    // fresh completed download even though the user never received the file.
+    let logged = false;
+    res.on('finish', () => {
+      if (logged) return;
+      logged = true;
+      logAlbumDownload().catch((err) => console.error('Failed to log completed ZIP download:', err.message));
+    });
+    let clientGone = false;
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientGone = true;
+        console.warn(`ZIP download for album ${album._id} aborted before completion (user ${user._id})`);
+        // Stop pulling from Wasabi for a client that has already left.
+        try { archive.abort(); } catch { /* already finished */ }
+      }
+    });
+
+    archive.pipe(res);
+
+    // Fetch one track at a time and hand archiver a finished BUFFER.
+    //
+    // This previously opened five Wasabi streams at once and kept queueing
+    // more — up to one per track — while archiver, which processes entries
+    // strictly in order, consumed only the first. The rest sat idle until the
+    // socket timed out, and that error surfaced after headers had been sent,
+    // so the response was never ended and the browser hung forever on a
+    // download that could not progress. Larger albums queued more streams and
+    // failed more reliably.
+    //
+    // Buffering each track fully before appending means exactly one Wasabi
+    // connection is open at a time and it is drained immediately, so nothing
+    // can idle out. Peak memory is one track (~5-15 MB), not the whole album.
+    let appended = 0;
+    for (const track of tracks) {
+      if (clientGone) break;
+      const key = track.audioFile?.wasabiKey || track.audioFile?.key;
+      if (!key) {
+        console.warn(`[zip] track ${track._id} has no audio key — skipped`);
+        continue;
+      }
+      try {
+        const cmd = new GetObjectCommand({ Bucket: process.env.WASABI_BUCKET_NAME, Key: key });
+        const s3Resp = await s3Client.send(cmd);
+        const bytes = await s3Resp.Body.transformToByteArray();
+        const trackFilename = buildSafeFilename(`${track.artist} - ${track.title}.mp3`);
+        archive.append(Buffer.from(bytes), { name: trackFilename });
+        appended++;
+      } catch (err) {
+        // One unreadable track must not sink the whole album.
+        console.error(`Failed to fetch track ${track._id} (${key}):`, err.message);
+      }
+    }
+
+    if (clientGone) return;
+
+    if (appended === 0) {
+      console.error(`[zip] album ${album._id}: no tracks could be read — aborting`);
+      try { archive.abort(); } catch {}
+      if (!res.headersSent) {
+        return res.status(500).json({ success: false, message: 'No audio files could be read for this album' });
+      }
+      return res.destroy(new Error('no readable tracks'));
+    }
+
+    console.log(`[zip] album ${album._id}: streaming ${appended}/${tracks.length} track(s)`);
+    await archive.finalize();
+  } catch (error) {
+    console.error('downloadAlbumFile error:', error.message, error.stack);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: error.message
+      });
+    }
+  }
+};
+
+// @desc    Get download history
+// @route   GET /api/downloads/history
+// @access  Private
+export const getDownloadHistory = async (req, res) => {
+  try {
+    const { limit = 20, page = 1 } = req.query;
+
+    const downloads = await Download.find({ userId: req.user.id })
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .populate('trackId', 'title artist coverArt')
+      .populate('albumId', 'name coverArt')
+      .populate('sourceId', 'name platform');
+
+    const total = await Download.countDocuments({ userId: req.user.id });
+
+    res.status(200).json({
+      success: true,
+      count: downloads.length,
+      total,
+      page: parseInt(page),
+      pages: Math.ceil(total / parseInt(limit)),
+      data: downloads
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get trending downloads (most downloaded tracks)
+// @route   GET /api/downloads/trending
+// @access  Public
+export const getTrendingDownloads = async (req, res) => {
+  try {
+    const { limit = 10, period = '7d' } = req.query;
+
+    // Calculate date range
+    const periodMap = {
+      '24h': 1,
+      '7d': 7,
+      '30d': 30,
+      'all': 365 * 10
+    };
+    const days = periodMap[period] || 7;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    // Get most downloaded tracks
+    const trendingTracks = await Download.aggregate([
+      {
+        $match: {
+          type: 'single',
+          createdAt: { $gte: startDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$trackId',
+          downloadCount: { $sum: 1 }
+        }
+      },
+      {
+        $sort: { downloadCount: -1 }
+      },
+      {
+        $limit: parseInt(limit)
+      }
+    ]);
+
+    // Populate track details
+    const trackIds = trendingTracks.map(t => t._id);
+    const tracks = await Track.find({ _id: { $in: trackIds } })
+      .populate('sourceId', 'name platform')
+      .populate('albumId', 'name coverArtKey coverArt');
+
+    // Merge download counts with track data and sign cover art URLs
+    const result = await Promise.all(tracks.map(async (track) => {
+      const trending = trendingTracks.find(t => t._id.toString() === track._id.toString());
+      const trackObj = track.toObject();
+      
+      // Sign cover art URL
+      if (trackObj.coverArtKey) {
+        try {
+          trackObj.coverArt = await getSignedDownloadUrl(trackObj.coverArtKey, 7200);
+        } catch (e) { /* fallback to existing coverArt */ }
+      } else if (!trackObj.coverArt && trackObj.albumId?.coverArtKey) {
+        try {
+          trackObj.coverArt = await getSignedDownloadUrl(trackObj.albumId.coverArtKey, 7200);
+        } catch (e) { /* fallback */ }
+      }
+      
+      return {
+        ...trackObj,
+        trendingDownloads: trending?.downloadCount || 0
+      };
+    }));
+
+    // Sort by download count
+    result.sort((a, b) => b.trendingDownloads - a.trendingDownloads);
+
+    res.status(200).json({
+      success: true,
+      period,
+      count: result.length,
+      data: result
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get recent uploads
+// @route   GET /api/downloads/recent
+// @access  Public
+export const getRecentUploads = async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+
+    const recentTracks = await Track.find({ status: 'published' })
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .populate('sourceId', 'name platform')
+      .populate('albumId', 'name coverArtKey coverArt');
+
+    // Sign cover art URLs
+    const tracksWithUrls = await Promise.all(recentTracks.map(async (track) => {
+      const trackObj = track.toObject();
+      if (trackObj.coverArtKey) {
+        try {
+          trackObj.coverArt = await getSignedDownloadUrl(trackObj.coverArtKey, 7200);
+        } catch (e) { /* fallback */ }
+      } else if (!trackObj.coverArt && trackObj.albumId?.coverArtKey) {
+        try {
+          trackObj.coverArt = await getSignedDownloadUrl(trackObj.albumId.coverArtKey, 7200);
+        } catch (e) { /* fallback */ }
+      }
+      return trackObj;
+    }));
+
+    res.status(200).json({
+      success: true,
+      count: tracksWithUrls.length,
+      data: tracksWithUrls
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get download statistics (Admin)
+// @route   GET /api/downloads/stats
+// @access  Private/Admin
+export const getDownloadStats = async (req, res) => {
+  try {
+    const { period = '30d' } = req.query;
+
+    const periodMap = {
+      '24h': 1,
+      '7d': 7,
+      '30d': 30,
+      '90d': 90,
+      'all': 365 * 10
+    };
+    const days = periodMap[period] || 30;
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    // Total downloads
+    const totalDownloads = await Download.countDocuments({
+      createdAt: { $gte: startDate }
+    });
+
+    // Downloads by type
+    const downloadsByType = await Download.aggregate([
+      { $match: { createdAt: { $gte: startDate } } },
+      { $group: { _id: '$type', count: { $sum: 1 } } }
+    ]);
+
+    // Top sources
+    // Some downloads may not have sourceId (e.g. legacy downloads tied to album/track only)
+    const topSources = await Download.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: startDate },
+          sourceId: { $ne: null }
+        }
+      },
+      { $group: { _id: '$sourceId', downloads: { $sum: 1 } } },
+      { $sort: { downloads: -1 } },
+      { $limit: 5 }
+    ]);
+
+    const sourcesWithDetails = await Source.find({
+      _id: { $in: topSources.map(s => s._id) }
+    });
+
+    const topSourcesData = topSources
+      .filter(s => s?._id)
+      .map(s => {
+        const source = sourcesWithDetails.find(src => String(src._id) === String(s._id));
+        return {
+          source: source?.name,
+          platform: source?.platform,
+          downloads: s.downloads || 0
+        };
+      });
+
+    // Downloads over time
+    const downloadsOverTime = await Download.aggregate([
+      { $match: { createdAt: { $gte: startDate } } },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: '%Y-%m-%d', date: '$createdAt' }
+          },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      period,
+      data: {
+        totalDownloads,
+        downloadsByType,
+        topSources: topSourcesData,
+        downloadsOverTime
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// @desc    Get paginated download logs (Admin)
+// @route   GET /api/downloads/admin/logs
+// @access  Private/Admin
+export const getAdminDownloadLogs = async (req, res) => {
+  try {
+    const { page = 1, limit = 50, search = '', dateFrom, dateTo, fileType, userId: filterUserId } = req.query;
+    const filters = [];
+    if (search) filters.push({ $or: [{ email: { $regex: search, $options: 'i' } }, { fileName: { $regex: search, $options: 'i' } }, { 'userId.name': { $regex: search, $options: 'i' } }] });
+    if (dateFrom || dateTo) {
+      const dateFilter = {};
+      if (dateFrom) dateFilter.$gte = new Date(dateFrom);
+      if (dateTo) { const d = new Date(dateTo); d.setHours(23, 59, 59, 999); dateFilter.$lte = d; }
+      filters.push({ createdAt: dateFilter });
+    }
+    if (fileType === 'MP3') {
+      // null / missing field = legacy record treated as MP3 (single track download)
+      filters.push({ $or: [{ fileType: 'MP3' }, { fileType: { $in: [null, ''] } }, { fileType: { $exists: false } }] });
+      filters.push({ type: { $ne: 'bulk' } });
+    } else if (fileType === 'ZIP') {
+      filters.push({ $or: [{ fileType: 'ZIP' }, { $and: [{ $or: [{ fileType: { $in: [null, ''] } }, { fileType: { $exists: false } }] }, { type: 'bulk' }] }] });
+    }
+    if (filterUserId) filters.push({ userId: filterUserId });
+    const query = filters.length > 0 ? { $and: filters } : {};
+
+    const total = await Download.countDocuments(query);
+    const logs = await Download.find(query)
+      .sort({ createdAt: -1 })
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .limit(parseInt(limit))
+      .populate('userId', 'name email subscription')
+      .populate('trackId', 'title artist')
+      .populate('albumId', 'name')
+      .lean();
+
+    const data = logs.map(d => {
+      const ua = d.userAgent ? parseUA(d.userAgent) : {};
+      return {
+        _id: d._id,
+        userName: d.userId?.name || '—',
+        email: d.email || d.userId?.email || '—',
+        fileName: d.fileName || (d.trackId ? `${d.trackId.artist} - ${d.trackId.title}` : d.albumId?.name) || '—',
+        fileType: d.fileType || (d.type === 'bulk' ? 'ZIP' : 'MP3'),
+        section: d.section || '—',
+        planId: d.planId || d.userId?.subscription?.planId || d.userId?.subscription?.plan || '—',
+        ipAddress: d.ipAddress || '—',
+        deviceBrowser: d.deviceBrowser || ua.browser || '—',
+        deviceOS: d.deviceOS || ua.os || '—',
+        deviceName: d.deviceName || ua.device || '—',
+        fileSize: d.fileSize || 0,
+        createdAt: d.createdAt
+      };
+    });
+
+    res.status(200).json({ success: true, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)), data });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Export download logs as CSV (Admin)
+// @route   GET /api/downloads/admin/export
+// @access  Private/Admin
+export const exportDownloadLogs = async (req, res) => {
+  try {
+    const { search = '', dateFrom, dateTo, fileType } = req.query;
+    const exportFilters = [];
+    if (search) exportFilters.push({ $or: [{ email: { $regex: search, $options: 'i' } }, { fileName: { $regex: search, $options: 'i' } }] });
+    if (dateFrom || dateTo) {
+      const dateFilter = {};
+      if (dateFrom) dateFilter.$gte = new Date(dateFrom);
+      if (dateTo) { const d = new Date(dateTo); d.setHours(23, 59, 59, 999); dateFilter.$lte = d; }
+      exportFilters.push({ createdAt: dateFilter });
+    }
+    if (fileType === 'MP3') {
+      exportFilters.push({ $or: [{ fileType: 'MP3' }, { fileType: { $in: [null, ''] } }, { fileType: { $exists: false } }] });
+      exportFilters.push({ type: { $ne: 'bulk' } });
+    } else if (fileType === 'ZIP') {
+      exportFilters.push({ $or: [{ fileType: 'ZIP' }, { $and: [{ $or: [{ fileType: { $in: [null, ''] } }, { fileType: { $exists: false } }] }, { type: 'bulk' }] }] });
+    }
+    const query = exportFilters.length > 0 ? { $and: exportFilters } : {};
+
+    const logs = await Download.find(query).sort({ createdAt: -1 }).limit(10000)
+      .populate('userId', 'name email subscription').populate('trackId', 'title artist').populate('albumId', 'name').lean();
+
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const headers = ['Date', 'User', 'Email', 'File', 'Type', 'Section', 'Plan', 'IP', 'Browser', 'OS', 'Device', 'Size (bytes)'];
+    const rows = logs.map(d => {
+      const ua = d.userAgent ? parseUA(d.userAgent) : {};
+      return [
+        d.createdAt?.toISOString() ?? '',
+        d.userId?.name ?? '—',
+        d.email || d.userId?.email || '—',
+        d.fileName || (d.trackId ? `${d.trackId.artist} - ${d.trackId.title}` : d.albumId?.name) || '—',
+        d.fileType || (d.type === 'bulk' ? 'ZIP' : 'MP3'),
+        d.section || '—',
+        d.planId || d.userId?.subscription?.planId || d.userId?.subscription?.plan || '—',
+        d.ipAddress || '—',
+        d.deviceBrowser || ua.browser || '—',
+        d.deviceOS || ua.os || '—',
+        d.deviceName || ua.device || '—',
+        d.fileSize ?? 0
+      ].map(esc).join(',');
+    });
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="downloads-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(csv);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// @desc    Piracy / suspicious activity alerts (Admin)
+// @route   GET /api/downloads/admin/alerts
+// @access  Private/Admin
+export const getDownloadAlerts = async (req, res) => {
+  try {
+    const now = new Date();
+    const h1  = new Date(now - 60 * 60 * 1000);
+    const h24 = new Date(now - 24 * 60 * 60 * 1000);
+    const d7  = new Date(now - 7 * 24 * 60 * 60 * 1000);
+    const alerts = [];
+
+    // >10 ZIPs in 1 hour
+    const bulkSpree = await Download.aggregate([
+      { $match: { fileType: 'ZIP', createdAt: { $gte: h1 } } },
+      { $group: { _id: '$userId', count: { $sum: 1 }, email: { $first: '$email' } } },
+      { $match: { count: { $gt: 10 } } }, { $sort: { count: -1 } }
+    ]);
+    bulkSpree.forEach(u => alerts.push({ type: 'bulk_spree', severity: 'high',
+      message: `${u.email || u._id} downloaded ${u.count} ZIPs in the last hour`, userId: u._id, email: u.email, count: u.count }));
+
+    // >3 unique IPs in 24h
+    const multiIp = await Download.aggregate([
+      { $match: { createdAt: { $gte: h24 } } },
+      { $group: { _id: { userId: '$userId', ip: '$ipAddress' } } },
+      { $group: { _id: '$_id.userId', uniqueIPs: { $sum: 1 }, email: { $first: '$email' } } },
+      { $match: { uniqueIPs: { $gt: 3 } } }, { $sort: { uniqueIPs: -1 } }
+    ]);
+    multiIp.forEach(u => alerts.push({ type: 'multi_ip', severity: 'high',
+      message: `${u.email || u._id} accessed from ${u.uniqueIPs} different IPs in 24h`, userId: u._id, email: u.email, count: u.uniqueIPs }));
+
+    // >20 downloads in first hour after subscription start
+    const newSubs = await User.aggregate([
+      { $match: { 'subscription.startDate': { $gte: h24 } } },
+      { $project: { email: 1, startDate: '$subscription.startDate' } }
+    ]);
+    await Promise.all(newSubs.map(async (u) => {
+      const endWindow = new Date(new Date(u.startDate).getTime() + 60 * 60 * 1000);
+      const cnt = await Download.countDocuments({ userId: u._id, createdAt: { $gte: u.startDate, $lte: endWindow } });
+      if (cnt > 20) alerts.push({ type: 'new_sub_mass_download', severity: 'medium',
+        message: `${u.email} downloaded ${cnt} files in first hour after subscribing`, userId: u._id, email: u.email, count: cnt });
+    }));
+
+    // Unusual hours 2–5am (>15 downloads in 7 days)
+    const lateNight = await Download.aggregate([
+      { $match: { createdAt: { $gte: d7 } } },
+      { $addFields: { hour: { $hour: '$createdAt' } } },
+      { $match: { hour: { $gte: 2, $lte: 5 } } },
+      { $group: { _id: '$userId', count: { $sum: 1 }, email: { $first: '$email' } } },
+      { $match: { count: { $gt: 15 } } }, { $sort: { count: -1 } }
+    ]);
+    lateNight.forEach(u => alerts.push({ type: 'unusual_hours', severity: 'low',
+      message: `${u.email || u._id} made ${u.count} downloads between 2–5am in 7 days`, userId: u._id, email: u.email, count: u.count }));
+
+    // >50 downloads in 24h
+    const massDownload = await Download.aggregate([
+      { $match: { createdAt: { $gte: h24 } } },
+      { $group: { _id: '$userId', count: { $sum: 1 }, email: { $first: '$email' } } },
+      { $match: { count: { $gt: 50 } } }, { $sort: { count: -1 } }
+    ]);
+    massDownload.forEach(u => alerts.push({ type: 'mass_download', severity: 'high',
+      message: `${u.email || u._id} downloaded ${u.count} files in 24h`, userId: u._id, email: u.email, count: u.count }));
+
+    alerts.sort((a, b) => ({ high: 0, medium: 1, low: 2 }[a.severity] ?? 3) - ({ high: 0, medium: 1, low: 2 }[b.severity] ?? 3));
+    res.status(200).json({ success: true, total: alerts.length, data: alerts });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
