@@ -4,76 +4,81 @@ name: API health check
 # NOT from the VPS, because the failure this exists to catch is the API becoming
 # unreachable. A checker running on the same box cannot report that.
 #
-# Background: in August the Stripe webhook endpoint failed for nine consecutive
-# days and was disabled, and nobody noticed until customers reported paying and
-# staying on the free plan. Stripe sent five warning emails first. The whole
-# outage was silent because nothing was watching.
-#
 # /api/health returns 503 when the database is disconnected OR the event loop is
-# blocked for more than 5 seconds — the condition that starves incoming webhook
-# requests while the site still looks up.
+# blocked for more than 5 seconds. No answer at all (HTTP 000) means the request
+# never completed: process down/restarting, Nginx, TLS, DNS or network.
 #
-# NOTE: GitHub's scheduler is best-effort. A */10 cron typically runs every
-# 10-25 minutes and can be delayed further when GitHub is busy, so treat this as
-# a safety net, not a pager. An external uptime service polling every minute is
-# still worth having alongside it.
-# NOTE: scheduled workflows are disabled automatically after 60 days without
-# repository activity. GitHub emails you before that happens.
+# ALERTING POLICY: GitHub emails on every failed run, so a run only fails when
+# the API stays unhealthy for ~4 minutes (4 probes, 60s apart). A blip that
+# recovers inside that window is logged as a warning on the run, not an email.
+#
+# NOTE: GitHub's scheduler is best-effort and throttles quiet repositories, so
+# runs can be 10 minutes to several hours apart. Treat this as a safety net; an
+# external uptime monitor (1–5 min checks) is the real pager.
+# NOTE: scheduled workflows are disabled after 60 days without a commit to this
+# repository. GitHub emails a warning first — a commit re-arms it.
 
 on:
   schedule:
     - cron: '*/10 * * * *'
-  workflow_dispatch:        # lets you run it on demand from the Actions tab
+  workflow_dispatch:        # run on demand from the Actions tab
 
 jobs:
   health:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Pinned instead of ubuntu-latest, which removes the migration notice.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      URL: https://api.tododjs.com/api/health
+      ATTEMPTS: '4'
+      GAP_SECONDS: '60'
     steps:
       - name: Probe /api/health
         run: |
           set -uo pipefail
-          URL="https://api.tododjs.com/api/health"
+          CODE=000
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            rm -f body.json curl.err
+            OUT=$(curl -sS --connect-timeout 10 --max-time 20 -o body.json \
+              -w '%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s' \
+              "$URL" 2>curl.err)
+            RC=$?
+            CODE=${OUT%% *}
+            [ -z "$CODE" ] && CODE=000
 
-          # Two attempts 20s apart, so a single blip does not page anyone.
-          for attempt in 1 2; do
-            echo "── attempt $attempt ──"
-            BODY=$(curl -sS --max-time 25 -w $'\n%{http_code}' "$URL" 2>&1) || BODY=$'\n000'
-            CODE=$(printf '%s' "$BODY" | tail -1)
-            JSON=$(printf '%s' "$BODY" | sed '$d')
-
-            echo "HTTP $CODE"
-            echo "$JSON"
+            echo "attempt $attempt/$ATTEMPTS  $(date -u +%H:%M:%SZ)  HTTP $CODE  curl_exit=$RC  ${OUT#* }"
+            # Keep curl's own error text: it is what tells a timeout apart from
+            # a refused connection, a DNS failure or a TLS problem.
+            if [ -s curl.err ]; then sed 's/^/  /' curl.err; fi
+            if [ -s body.json ]; then head -c 400 body.json; echo; fi
 
             if [ "$CODE" = "200" ]; then
+              if [ "$attempt" -gt 1 ]; then
+                echo "::warning::API recovered on attempt $attempt after a short outage (HTTP 000/5xx for under $(( (attempt - 1) * GAP_SECONDS + 20 ))s). Not alerting."
+              fi
               echo "✅ healthy"
               exit 0
             fi
 
-            if [ "$attempt" = "1" ]; then
-              echo "not healthy — retrying in 20s"
-              sleep 20
-            fi
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then sleep "$GAP_SECONDS"; fi
           done
 
           echo ""
           echo "══════════════════════════════════════════════════════════"
-          echo "❌ API UNHEALTHY — HTTP $CODE"
-          echo ""
+          echo "❌ API UNHEALTHY for ~$(( (ATTEMPTS - 1) * GAP_SECONDS ))s — last result HTTP $CODE"
           if [ "$CODE" = "000" ]; then
-            echo "No response at all: DNS, TLS, Nginx or the Node process."
-            echo "This is the shape of failure Stripe reported in August"
-            echo "(\"requests had other errors\" = could not complete the request)."
+            echo "No response at all. The curl line above says which:"
+            echo "  'timed out'          -> process blocked/hung or overloaded"
+            echo "  'Connection refused' -> Node down/restarting, or Nginx stopped"
+            echo "  'Could not resolve'  -> DNS"
+            echo "  SSL/TLS errors       -> certificate"
           elif [ "$CODE" = "503" ]; then
-            echo "The API answered but reports itself degraded."
-            echo "Check the JSON above:"
-            echo "  database: disconnected  -> MongoDB/Atlas connectivity"
-            echo "  eventLoop: blocked      -> CPU work starving the process"
-            echo "                             (ZIP building, audio analysis)"
-            echo "     Webhooks and API requests are being dropped right now."
+            echo "The API answered but reports itself degraded (see JSON):"
+            echo "  database: disconnected -> MongoDB Atlas connectivity"
+            echo "  eventLoop: blocked     -> CPU work starving the process"
           fi
           echo ""
-          echo "On the VPS:  pm2 status && pm2 logs tododjs-api --lines 50 --nostream"
+          echo "On the VPS:  pm2 status && pm2 logs tododjs-api --lines 100 --nostream"
           echo "Also check Stripe -> Developers -> Webhooks for delivery failures."
           echo "══════════════════════════════════════════════════════════"
           exit 1
